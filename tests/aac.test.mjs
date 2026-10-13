@@ -25,7 +25,7 @@ const {
 } = require("@testing-library/react");
 function studioTab(view,name){if(!view.queryByRole('tab',{name,exact:true}))fireEvent.click(view.getByRole('button',{name:'Studio',exact:true}));fireEvent.click(view.getByRole('tab',{name,exact:true}));}
 function expressivePreviewTest(){ test('Expressive delivery is neutral by default; explicit choices preview tags without changing words or speaking; reset clears tags',()=>{
- const calls=[];dom.window.hermesDesktop={api:async r=>{calls.push(r);throw Error('No call expected');}};
+ const calls=[];sdk.host.request=async (method,params)=>{calls.push({method,params});throw Error('No call expected');};
  const store=mod.createStore({get:()=>null,set(){}});store.dispatch({type:'select',text:'I need help'});
  const view=render(runtime.jsx(mod.AACPage,{store}));
  try{studioTab(view,'Expression');assert.ok(view.queryByLabelText('Delivery emotion'),'expressive delivery section missing');
@@ -93,6 +93,67 @@ if (fs.existsSync(new URL("../desktop/plugin.js", import.meta.url))) {
   await module.evaluate();
   mod = module.namespace;
 }
+test('SDK-only speech UI acknowledges submission, disables duplicate dispatch and exposes backend limits independently of scanning',async()=>{
+ const calls=[];let resolve;
+ sdk.host.request=(method,params)=>{calls.push({method,params});return new Promise(fn=>resolve=fn);};
+ const store=mod.createStore({get:()=>null,set(){}});store.dispatch({type:'select',text:'Words'});
+ const view=render(runtime.jsx(mod.AACPage,{store}));
+ try{assert.ok(!view.queryByRole('button',{name:'Stop',exact:true}));
+ assert.ok(view.queryByText(/Backend-owned audio/));
+ fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));assert.equal(calls.length,1);
+ assert.equal(view.getByRole('button',{name:'Speak',exact:true}).disabled,true);
+ fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));assert.equal(calls.length,1);
+ fireEvent.click(view.getByRole('button',{name:'Start scanning'}));fireEvent.click(view.getByRole('button',{name:'Stop scanning'}));assert.equal(calls.length,1);
+ studioTab(view,'Expression');fireEvent.click(view.getByRole('button',{name:'Reset delivery'}));assert.equal(calls.length,1);
+ resolve({status:'speaking'});await waitFor(()=>assert.ok(view.queryByText(/Submitted to Hermes/)));
+ assert.ok(!view.queryByText(/Playing your words|late audio discarded|Playback stopped/));
+ assert.equal(view.getByRole('button',{name:'Speak',exact:true}).disabled,false);
+ }finally{cleanup();}
+});
+test('Runtime has no raw bridge, REST, config writes, voice toggle or client playback fallback',()=>{
+ const source=fs.readFileSync(new URL('../desktop/plugin.js',import.meta.url),'utf8');
+ assert.doesNotMatch(source,/hermesDesktop|\/api\/|config\.set|voice\.toggle|new Audio|data_url/);
+ const view=render(runtime.jsx(mod.AACPage,{store:mod.createStore({get:()=>null,set(){}})}));
+ try{studioTab(view,'Expression');assert.ok(!view.queryByRole('button',{name:/Enable Eleven|model change/}));assert.ok(view.queryByRole('button',{name:'Open Hermes Settings'}));}finally{cleanup();}
+});
+test('Speech pending guard releases after immediate RPC error; scope changes after dispatch do not claim cancellation',async()=>{
+ let resolve,calls=0,scope={profile:'default',connectionId:'local'};
+ const player=mod.createSpeech({owner:()=>scope,request:()=>{calls++;return new Promise(fn=>resolve=fn);}});
+ const pending=player.speak('first');await assert.rejects(player.speak('second'),/pending/);assert.equal(calls,1);
+ scope={profile:'other',connectionId:'remote'};resolve({status:'speaking'});assert.equal((await pending).status,'speaking');
+ const failed=mod.createSpeech({owner:()=>scope,request:async()=>{throw Error('Gateway unavailable');}});
+ await assert.rejects(failed.speak('Words'),/Gateway unavailable/);await assert.rejects(failed.speak('Words again'),/Gateway unavailable/);
+ const malformed=mod.createSpeech({owner:()=>scope,request:async()=>({ok:true})});await assert.rejects(malformed.speak('Words'),/did not acknowledge/);
+});
+test('Expression checks unwrapped fresh v3 config, rejects changed scope before dispatch and sends only allowlisted tags',async()=>{
+ const choice={emotion:'happy',delivery:'whispers',cue:'sighs'},calls=[];
+ let scope={profile:'default',connectionId:'local'},provider='edge',model='eleven_v3',change=false;
+ const player=mod.createSpeech({owner:()=>scope,request:async(method,params)=>{calls.push({method,params});if(method==='config.get'){if(change)scope={profile:'other',connectionId:'local'};return {config:{tts:{provider,elevenlabs:{model_id:model}}}};}return {status:'speaking'};}});
+ await assert.rejects(player.speak('Words',choice),/requires active/);assert.equal(calls.length,1);
+ provider='elevenlabs';model='old';await assert.rejects(player.speak('Words',choice),/requires active/);assert.equal(calls.length,2);
+ model='eleven_v3';change=true;await assert.rejects(player.speak('Words',choice),/before dispatch/);assert.equal(calls.length,3);
+ change=false;await player.speak('  My words!  ',choice);
+ assert.equal(JSON.stringify(calls.at(-1)),JSON.stringify({method:'voice.tts',params:{text:'[happy] [whispers] [sighs]   My words!  ',profile:'other'}}));
+ assert.equal(JSON.stringify(calls.at(-2).params),JSON.stringify({key:'full',profile:'other'}));
+ const failed=mod.createSpeech({owner:()=>scope,request:async()=>{throw Error('Config unavailable');}});await assert.rejects(failed.speak('Words',choice),/Config unavailable/);
+ const unknown=mod.createSpeech({owner:()=>({}),request:async()=>{assert.fail('must not dispatch');}});await assert.rejects(unknown.speak('Words'),/known gateway/);
+});
+test('Read-only voice StrictMode reload clears stale snapshot and surfaces immediate config errors',async()=>{
+ let fail=false,profile='default';sdk.host.state.profile={get:()=>profile};
+ sdk.host.request=async()=>{if(fail)throw Error('Config unavailable');return {config:{tts:{provider:'edge',edge:{voice:'current'}}}};};
+ const view=render(runtime.jsx(React.StrictMode,{children:runtime.jsx(mod.VoicePanel,{})}));
+ try{fireEvent.click(view.getByRole('button',{name:'Read current voice settings'}));await waitFor(()=>assert.ok(view.queryByText(/edge · current/)));
+ fail=true;fireEvent.click(view.getByRole('button',{name:'Read current voice settings'}));await waitFor(()=>assert.ok(view.queryByText(/Config unavailable/)));assert.ok(!view.queryByText(/edge · current/));
+ let resolve;sdk.host.request=()=>new Promise(fn=>resolve=fn);fireEvent.click(view.getByRole('button',{name:'Read current voice settings'}));profile='other';resolve({config:{tts:{provider:'edge'}}});await waitFor(()=>assert.ok(view.queryByText(/Gateway\/profile changed/)));
+ }finally{cleanup();sdk.host.state.profile={get:()=> 'default'};}
+});
+test('Immediate speech RPC errors are visible in mounted UI and unmount does not cancel accepted backend work',async()=>{
+ sdk.host.request=async()=>{throw Error('Voice module unavailable');};const store=mod.createStore({get:()=>null,set(){}});store.dispatch({type:'select',text:'Words'});
+ const view=render(runtime.jsx(mod.AACPage,{store}));
+ try{fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));await waitFor(()=>assert.ok(view.queryByText(/Voice module unavailable/)));assert.equal(view.getByRole('button',{name:'Speak',exact:true}).disabled,false);
+ let resolve;sdk.host.request=()=>new Promise(fn=>resolve=fn);fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));view.unmount();resolve({status:'speaking'});await new Promise(fn=>setTimeout(fn,0));
+ }finally{cleanup();}
+});
 test('Cockpit keeps board first and focus mode hides studio without removing communication or access',()=>{
  const view=render(runtime.jsx(mod.AACPage,{store:mod.createStore({get:()=>null,set(){}})}));
  try{
@@ -102,7 +163,7 @@ test('Cockpit keeps board first and focus mode hides studio without removing com
  assert.ok(view.queryByRole('tablist',{name:'Communication studio'}));
  assert.ok(view.queryByRole('tabpanel'));
  fireEvent.click(view.getByRole('button',{name:'Focus mode'}));
- assert.ok(!view.queryByRole('tabpanel'));assert.ok(view.queryByLabelText('Communication board'));assert.ok(view.queryByRole('button',{name:'Stop',exact:true}));assert.ok(view.queryByRole('button',{name:'Start scanning'}));
+ assert.ok(!view.queryByRole('tabpanel'));assert.ok(view.queryByLabelText('Communication board'));assert.ok(!view.queryByRole('button',{name:'Stop',exact:true}));assert.ok(view.queryByRole('button',{name:'Start scanning'}));
  fireEvent.click(view.getByRole('button',{name:'Exit focus mode'}));
  assert.ok(view.queryByRole('tabpanel'));
  }finally{cleanup();}
@@ -134,7 +195,7 @@ test('Scanning excludes hidden studio tabs and closed disclosure/dialog targets 
  }finally{cleanup();context.setInterval=old;context.clearInterval=oldClear;}
 });
 test('Inline delivery presets are explicit, leave words untouched and never call native synthesis',()=>{
- const calls=[];dom.window.hermesDesktop={api:async r=>{calls.push(r);throw Error('Unexpected native call');}};const store=mod.createStore({get:()=>null,set(){}});store.dispatch({type:'select',text:'My words'});const view=render(runtime.jsx(mod.AACPage,{store}));
+ const calls=[];sdk.host.request=async (method,params)=>{calls.push({method,params});throw Error('Unexpected native call');};const store=mod.createStore({get:()=>null,set(){}});store.dispatch({type:'select',text:'My words'});const view=render(runtime.jsx(mod.AACPage,{store}));
  try{assert.ok(view.queryByRole('button',{name:'Delivery presets'}),'preset popover missing');fireEvent.click(view.getByRole('button',{name:'Delivery presets'}));fireEvent.click(view.getByRole('button',{name:'Thoughtful delivery'}));assert.equal(view.getByLabelText('Compact synthesis preview').textContent,'[thoughtful] My words');assert.equal(store.get().words[0],'My words');assert.equal(calls.length,0);assert.ok(!view.queryByRole('button',{name:'Thoughtful delivery'}));
  }finally{cleanup();}
 });
@@ -144,42 +205,6 @@ test('Focus round trip retains an unsent AI draft without sharing it',()=>{
  }finally{cleanup();}
 });
 expressivePreviewTest();
-test('Tagged Speak checks fresh owner v3 config and transmits only explicit allowed tags; mismatches refuse visibly',async()=>{
- let provider='edge',model='eleven_v3';const calls=[];
- dom.window.hermesDesktop={api:async r=>{calls.push(r);if(r.path==='/api/config')return{tts:{provider,elevenlabs:{model_id:model,voice_id:'v'}}};return{ok:true,provider:'elevenlabs',data_url:'data:audio/mpeg;base64,AA=='};}};
- const store=mod.createStore({get:()=>null,set(){}});store.dispatch({type:'select',text:'I need help'});const view=render(runtime.jsx(mod.AACPage,{store}));
- try{studioTab(view,'Expression');fireEvent.change(view.getByLabelText('Delivery emotion'),{target:{value:'happy'}});
- fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));
- await waitFor(()=>assert.ok(view.queryByText(/Expressive speech requires/)));assert.equal(calls.filter(r=>r.path==='/api/audio/speak').length,0);
- provider='elevenlabs';model='eleven_multilingual_v2';fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));await waitFor(()=>assert.equal(calls.filter(r=>r.path==='/api/config').length,2));assert.equal(calls.filter(r=>r.path==='/api/audio/speak').length,0);
- model='eleven_v3';fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));await waitFor(()=>assert.ok(view.queryByText(/Playing your words/)));
- assert.equal(calls.find(r=>r.path==='/api/audio/speak').body.text,'[happy] I need help');assert.ok(calls.every(r=>r.profile==='default'&&r.connectionId==='local'));assert.equal(store.get().words.join(' '),'I need help');
- }finally{cleanup();}
-});
-test('Enable Eleven v3 is staged, writes only model_id on pinned elevenlabs owner, and requires exact readback',async()=>{
- const calls=[];let config={tts:{provider:'elevenlabs',elevenlabs:{model_id:'eleven_multilingual_v2',voice_id:'keep'}}};
- dom.window.hermesDesktop={api:async r=>{calls.push(r);if(r.method==='PUT'){config={tts:{...config.tts,elevenlabs:{...config.tts.elevenlabs,...r.body.config.tts.elevenlabs}}};return{ok:true};}return config;}};
- const view=render(runtime.jsx(mod.AACPage,{store:mod.createStore({get:()=>null,set(){}})}));
- try{studioTab(view,'Expression');assert.ok(view.queryByRole('button',{name:'Review Enable Eleven v3'}),'model enable review missing');
- fireEvent.click(view.getByRole('button',{name:'Review Enable Eleven v3'}));await waitFor(()=>assert.ok(view.queryByRole('button',{name:'Enable Eleven v3 in shared Hermes settings'})));assert.ok(calls.every(r=>r.method==='GET'));
- fireEvent.click(view.getByRole('button',{name:'Enable Eleven v3 in shared Hermes settings'}));await waitFor(()=>assert.ok(view.queryByText(/Eleven v3 saved and verified/)));
- assert.equal(JSON.stringify(calls.find(r=>r.method==='PUT').body),JSON.stringify({config:{tts:{elevenlabs:{model_id:'eleven_v3'}}}}));assert.equal(config.tts.elevenlabs.voice_id,'keep');assert.equal(calls.at(-1).method,'GET');assert.ok(calls.every(r=>r.profile==='default'&&r.connectionId==='local'));
- }finally{cleanup();}
-});
-test('Expressive pending config, changed owner/model, provider mismatch audio and Stop never play late or stale audio',async()=>{
- const choice={emotion:'happy',delivery:'normal',cue:'none'};let played=0,scope={profile:'default',connectionId:'local'};
- const Audio=class{async play(){played++;}pause(){}};
- const valid={tts:{provider:'elevenlabs',elevenlabs:{model_id:'eleven_v3',voice_id:'v'}}};
- let resolve,calls=[];const player=mod.createSpeech({owner:()=>scope,Audio,api:r=>{calls.push(r);return r.path==='/api/config'?new Promise(fn=>resolve=fn):Promise.resolve({ok:true,provider:'elevenlabs',data_url:'data:audio/mpeg;base64,AA=='});}});
- const waiting=player.speak('Words',choice);player.stop();resolve(valid);await assert.rejects(waiting,/stopped/i);assert.equal(calls.length,1,'Stop during config must prevent synthesis POST');
- let reads=0;const stale=mod.createSpeech({owner:()=>scope,Audio,api:async r=>{if(r.path==='/api/config'){reads++;return reads===1?valid:{tts:{provider:'edge'}};}return{ok:true,provider:'elevenlabs',data_url:'data:audio/mpeg;base64,AA=='};}});
- await assert.rejects(stale.speak('Words',choice),/config changed/i);assert.equal(played,0);
- const mismatch=mod.createSpeech({owner:()=>scope,Audio,api:async r=>r.path==='/api/config'?valid:{ok:true,provider:'edge',data_url:'data:audio/mpeg;base64,AA=='}});
- await assert.rejects(mismatch.speak('Words',choice),/provider/i);assert.equal(played,0);
- const changed=mod.createSpeech({owner:()=>scope,Audio,api:async()=>{scope={profile:'other',connectionId:'local'};return valid;}});
- await assert.rejects(changed.speak('Words',choice),/Gateway\/profile changed/);assert.equal(played,0);
- const unknown=mod.createSpeech({owner:()=>({}),Audio,api:async()=>{throw Error('must not call');}});await assert.rejects(unknown.speak('Words',choice),/known gateway/);
-});
 test('Delivery allowlist bounds combinations, preserves literal words and rejects invalid AI delivery output',()=>{
  assert.equal(typeof mod.validateDelivery,'function','delivery validator missing');
  assert.equal(mod.deliveryText('  My words!  ',{emotion:'happy',delivery:'whispers',cue:'sighs'}),'[happy] [whispers] [sighs]   My words!  ');
@@ -210,30 +235,6 @@ test('Invalid expressive message shows refusal preview without crashing communic
  const store=mod.createStore({get:()=>null,set(){}});store.dispatch({type:'select',text:'[literal] words'});const view=render(runtime.jsx(mod.AACPage,{store}));
  try{studioTab(view,'Expression');fireEvent.change(view.getByLabelText('Delivery emotion'),{target:{value:'happy'}});assert.ok(view.queryByRole('button',{name:'Reset delivery'}));assert.match(view.getByLabelText('Exact synthesis preview').textContent,/refuses existing/);assert.equal(store.get().words[0],'[literal] words');fireEvent.click(view.getByRole('button',{name:'Reset delivery'}));assert.equal(view.getByLabelText('Exact synthesis preview').textContent,'[literal] words');}finally{cleanup();}
 });
-test('Model enable refuses stale owner/config and failed readback; provider mismatch never stages or writes',async()=>{
- let profile='default',config={tts:{provider:'elevenlabs',elevenlabs:{model_id:'old'}}},writes=0;
- sdk.host.state.profile={get:()=>profile};
- dom.window.hermesDesktop={api:async r=>{if(r.method==='PUT'){writes++;return{ok:true};}return config;}};
- const view=render(runtime.jsx(React.StrictMode,{children:runtime.jsx(mod.AACPage,{store:mod.createStore({get:()=>null,set(){}})})}));
- const review=async()=>{fireEvent.click(view.getByRole('button',{name:'Review Enable Eleven v3'}));await waitFor(()=>assert.ok(view.queryByRole('button',{name:'Enable Eleven v3 in shared Hermes settings'})));};
- try{studioTab(view,'Expression');await review();profile='other';fireEvent.click(view.getByRole('button',{name:'Enable Eleven v3 in shared Hermes settings'}));await waitFor(()=>assert.ok(view.queryByText(/Gateway\/profile changed. Review again/)));assert.equal(writes,0);
- profile='default';await review();config={tts:{provider:'elevenlabs',elevenlabs:{model_id:'changed'}}};fireEvent.click(view.getByRole('button',{name:'Enable Eleven v3 in shared Hermes settings'}));await waitFor(()=>assert.ok(view.queryByText(/Shared config changed/)));assert.equal(writes,0);
- await review();fireEvent.click(view.getByRole('button',{name:'Enable Eleven v3 in shared Hermes settings'}));await waitFor(()=>assert.ok(view.queryByText(/Model write could not be verified/)));assert.equal(writes,1);assert.ok(!view.queryByText(/Eleven v3 saved and verified/));
- config={tts:{provider:'edge'}};fireEvent.click(view.getByRole('button',{name:'Review Enable Eleven v3'}));await waitFor(()=>assert.ok(view.queryByText(/Select ElevenLabs explicitly/)));assert.ok(!view.queryByRole('button',{name:'Enable Eleven v3 in shared Hermes settings'}));assert.equal(writes,1);
- }finally{cleanup();sdk.host.state.profile={get:()=> 'default'};}
-});
-test('Expressive config read failures refuse without synthesis and neutral message remains exact',async()=>{
- let posts=0;const player=mod.createSpeech({owner:()=>({profile:'default',connectionId:'local'}),api:async r=>{if(r.method==='GET')throw Error('Config read unavailable');posts++;return{ok:true,data_url:'data:audio/mpeg;base64,AA=='};},Audio:class{async play(){}pause(){}}});
- await assert.rejects(player.speak('Words',{emotion:'sad',delivery:'normal',cue:'none'}),/Config read unavailable/);assert.equal(posts,0);await player.speak('Words');assert.equal(posts,1);player.stop();
-});
-test('Reset delivery while expressive synthesis is pending discards late tagged audio',async()=>{
- let resolve,played=0;const config={tts:{provider:'elevenlabs',elevenlabs:{model_id:'eleven_v3'}}};
- dom.window.hermesDesktop={api:r=>r.path==='/api/config'?Promise.resolve(config):new Promise(fn=>resolve=fn)};context.Audio=class{async play(){played++;}pause(){}};
- const store=mod.createStore({get:()=>null,set(){}});store.dispatch({type:'select',text:'Words'});const view=render(runtime.jsx(mod.AACPage,{store}));
- try{studioTab(view,'Expression');fireEvent.change(view.getByLabelText('Delivery emotion'),{target:{value:'happy'}});fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));await waitFor(()=>assert.equal(typeof resolve,'function'));
- fireEvent.click(view.getByRole('button',{name:'Reset delivery'}));resolve({ok:true,provider:'elevenlabs',data_url:'data:audio/mpeg;base64,AA=='});await waitFor(()=>assert.ok(view.queryByText(/late audio discarded/)));assert.equal(played,0);assert.equal(view.getByLabelText('Exact synthesis preview').textContent,'Words');
- }finally{cleanup();}
-});
 test("Start scanning owns keyboard focus and announces immediate/live targets across React rerenders", () => {
   let tick, cleared = 0;
   const oldSet = context.setInterval, oldClear = context.clearInterval;
@@ -262,32 +263,16 @@ test("Start scanning owns keyboard focus and announces immediate/live targets ac
     assert.equal(cleared,1);
   } finally {cleanup(); context.setInterval=oldSet; context.clearInterval=oldClear;}
 });
-test('ElevenLabs browser loads server-only catalog and search never writes config', async () => {
- const calls=[];
- dom.window.hermesDesktop={api:async r=>{calls.push(r); if(r.path==='/api/config')return {tts:{provider:'edge',elevenlabs:{voice_id:'old'}}}; if(r.path==='/api/audio/elevenlabs/voices')return {available:true,voices:[{voice_id:'v1',name:'Alice',label:'Alice (professional)'},{voice_id:'v2',name:'Bob',label:'Bob'}]}; throw Error('Unexpected endpoint');}};
- const view=render(runtime.jsx(mod.AACPage,{store:mod.createStore({get:()=>null,set(){}})}));
- try {studioTab(view,'Access & voice');
- assert.ok(view.queryByRole('button',{name:'Load ElevenLabs voices'}),'catalog loader missing');
- fireEvent.click(view.getByRole('button',{name:'Load ElevenLabs voices'}));
- await waitFor(()=>assert.ok(view.queryByRole('button',{name:'Choose Alice (professional)'})));
- fireEvent.change(view.getByLabelText('Search ElevenLabs voices'),{target:{value:'Alice'}});
- assert.ok(!view.queryByRole('button',{name:'Choose Bob'}));
- fireEvent.click(view.getByRole('button',{name:'Choose Alice (professional)'}));
- assert.equal(calls.length,2); assert.ok(calls.every(r=>r.profile==='default'&&r.connectionId==='local'));
- assert.ok(view.getByText(/edge · old/));
- }finally{cleanup();}
-});
-test('Applying selected ElevenLabs voice writes only explicit shared fields and verifies exact readback', async()=>{
- const calls=[]; let settings={tts:{provider:'edge',elevenlabs:{voice_id:'old',model_id:'keep'}}};
- dom.window.hermesDesktop={api:async r=>{calls.push(r); if(r.path==='/api/audio/elevenlabs/voices')return {available:true,voices:[{voice_id:'v1',name:'Alice',label:'Alice'}]}; if(r.method==='PUT'){settings={tts:{...settings.tts,...r.body.config.tts,elevenlabs:{...settings.tts.elevenlabs,...r.body.config.tts.elevenlabs}}};return {ok:true};} return settings;}};
+test('Read-only voice settings unwrap SDK config and navigate Settings without catalog or writes', async()=>{
+ const calls=[];let destination;
+ sdk.host.request=async(method,params)=>{calls.push({method,params});return {config:{tts:{provider:'elevenlabs',elevenlabs:{voice_id:'current',model_id:'eleven_v3'}}}};};
+ sdk.host.navigate=path=>destination=path;
  const view=render(runtime.jsx(mod.VoicePanel,{}));
- try{fireEvent.click(view.getByRole('button',{name:'Load ElevenLabs voices'}));await waitFor(()=>assert.ok(view.queryByRole('button',{name:'Choose Alice'})));
- fireEvent.click(view.getByRole('button',{name:'Choose Alice'}));
- assert.ok(view.queryByRole('button',{name:'Apply ElevenLabs voice to Hermes'}),'explicit config apply missing');
- fireEvent.click(view.getByRole('button',{name:'Apply ElevenLabs voice to Hermes'}));
- await waitFor(()=>assert.ok(view.queryByText(/Saved and verified/)));
- const write=calls.find(r=>r.method==='PUT');assert.equal(JSON.stringify(write.body),JSON.stringify({config:{tts:{provider:'elevenlabs',elevenlabs:{voice_id:'v1'}}}}));
- assert.equal(calls.at(-1).path,'/api/config');assert.equal(settings.tts.elevenlabs.model_id,'keep');
+ try{fireEvent.click(view.getByRole('button',{name:'Read current voice settings'}));
+ await waitFor(()=>assert.ok(view.queryByText(/elevenlabs · current · eleven_v3/)));
+ assert.equal(JSON.stringify(calls),JSON.stringify([{method:'config.get',params:{key:'full',profile:'default'}}]));
+ assert.ok(!view.queryByRole('button',{name:/Choose |Apply |Enable /}));
+ fireEvent.click(view.getByRole('button',{name:'Open Hermes Settings'}));assert.equal(destination,'/settings');
  }finally{cleanup();}
 });
 test('Situational workspace changes shortcuts and topics without moving core or sharing',()=>{
@@ -322,16 +307,6 @@ test('AI phrase proposals have reviewed sharing, streamed progress and click-onl
  assert.ok(!view.queryByRole('progressbar'));
  }finally{cleanup();}
 });
-test('Voice unavailable state provides Settings navigation and never substitutes a catalog',async()=>{
- let destination; sdk.host.navigate=p=>destination=p;
- dom.window.hermesDesktop={api:async r=>r.path==='/api/config'?{tts:{provider:'edge'}}:{available:false,voices:[],error:'unauthorized'}};
- const view=render(runtime.jsx(mod.VoicePanel,{}));
- try{fireEvent.click(view.getByRole('button',{name:'Load ElevenLabs voices'}));await waitFor(()=>assert.ok(view.queryByText(/ElevenLabs unavailable/)));
- assert.ok(!view.queryByRole('button',{name:/Choose /}));
- assert.ok(view.queryByRole('button',{name:'Open Hermes Settings'}),'credential settings navigation missing');
- fireEvent.click(view.getByRole('button',{name:'Open Hermes Settings'}));assert.equal(destination,'/settings');
- }finally{cleanup();}
-});
 test('Workspace and voice cards use responsive themed layout and reduced-motion-safe progress',()=>{
  const html=renderToStaticMarkup(runtime.jsx(mod.AACPage,{store:mod.createStore({get:()=>null,set(){}})}));
  assert.ok(html.includes('.haac .suggestion-cards'),'responsive suggestion styling missing');
@@ -350,32 +325,9 @@ test('Scan timer reaches category and message actions using actual page keyboard
  fireEvent.keyDown(document.activeElement,{key:'Escape'});assert.ok(!view.container.querySelector('.scan-target'));
  }finally{cleanup();context.setInterval=old;context.clearInterval=oldClear;}
 });
-test('Voice writes refuse changed profile and surface failed readback rather than claim success',async()=>{
- let reads=0,writes=0,profile='default';sdk.host.state.profile={get:()=>profile};
- dom.window.hermesDesktop={api:async r=>{if(r.path.includes('/voices'))return{available:true,voices:[{voice_id:'v',label:'Voice'}]};if(r.method==='PUT'){writes++;return{ok:true};}reads++;return{tts:{provider:'edge',elevenlabs:{voice_id:'old'}}};}};
- const view=render(runtime.jsx(mod.VoicePanel,{}));
- try{fireEvent.click(view.getByRole('button',{name:'Load ElevenLabs voices'}));await waitFor(()=>assert.ok(view.queryByRole('button',{name:'Choose Voice'})));fireEvent.click(view.getByRole('button',{name:'Choose Voice'}));
- profile='other';fireEvent.click(view.getByRole('button',{name:'Apply ElevenLabs voice to Hermes'}));assert.equal(writes,0);assert.ok(view.getByText(/Gateway\/profile changed/));
- profile='default';fireEvent.click(view.getByRole('button',{name:'Apply ElevenLabs voice to Hermes'}));await waitFor(()=>assert.ok(view.queryByText(/could not be verified/)));assert.equal(writes,1);assert.equal(reads,2);assert.ok(!view.queryByText(/Saved and verified/));
- }finally{cleanup();sdk.host.state.profile={get:()=> 'default'};}
-});
 test('Phrase parser bounds and treats markup as plain suggestion text',()=>{
  assert.throws(()=>mod.parsePhrases('{"phrases":[]}'));assert.throws(()=>mod.parsePhrases('{"phrases":[7]}'));assert.throws(()=>mod.parsePhrases('not json'));
  assert.equal(mod.parsePhrases('{"phrases":["<script>literal</script>"]}')[0],'<script>literal</script>');
-});
-test('Voice browser survives React StrictMode effect replay',async()=>{
- dom.window.hermesDesktop={api:async r=>r.path==='/api/config'?{tts:{provider:'edge'}}:{available:true,voices:[{voice_id:'strict',label:'Strict voice'}]}};
- const view=render(runtime.jsx(React.StrictMode,{children:runtime.jsx(mod.VoicePanel,{})}));
- try{fireEvent.click(view.getByRole('button',{name:'Load ElevenLabs voices'}));await waitFor(()=>assert.ok(view.queryByRole('button',{name:'Choose Strict voice'})));}finally{cleanup();}
-});
-test('Failed voice reload removes old gateway catalog and cannot stage a stale voice',async()=>{
- let fail=false;
- dom.window.hermesDesktop={api:async r=>{if(fail)throw Error('Gateway offline');return r.path==='/api/config'?{tts:{provider:'edge'}}:{available:true,voices:[{voice_id:'old',label:'Old voice'}]};}};
- const view=render(runtime.jsx(mod.VoicePanel,{}));
- try{fireEvent.click(view.getByRole('button',{name:'Load ElevenLabs voices'}));await waitFor(()=>assert.ok(view.queryByRole('button',{name:'Choose Old voice'})));fail=true;
- fireEvent.click(view.getByRole('button',{name:'Load ElevenLabs voices'}));await waitFor(()=>assert.ok(view.queryByText(/Gateway offline/)));
- assert.ok(!view.queryByRole('button',{name:'Choose Old voice'}),'failed reload left stale catalog actionable');
- }finally{cleanup();}
 });
 test("OBF import validates structure, references, executable actions and preserves blank cells", () => {
   assert.equal(typeof mod?.validateBoard, "function");
@@ -424,63 +376,15 @@ test("board proposals require approval and persist custom boards without private
 });
 test("Hermes speech sends exact text without synthesis overrides", async () => {
   assert.equal(typeof mod.createSpeech, "function");
-  const calls = [], played = [];
+  const calls = [];
   const player = mod.createSpeech({
-    api: async request => { calls.push(request); return {ok:true, data_url:'data:audio/mpeg;base64,AA=='}; },
-    owner: () => ({profile:'default', connectionId:'local'}),
-    Audio: class { constructor(url) { this.src=url; } async play() { played.push(this.src); } pause() {} }
+    request: async (method, params) => { calls.push({method,params}); return {status:'speaking'}; },
+    owner: () => ({profile:'default', connectionId:'local'})
   });
-  await player.speak('I need help');
-  assert.equal(JSON.stringify(calls[0].body), JSON.stringify({text:'I need help'}));
-  assert.equal(calls[0].path, '/api/audio/speak');
-  assert.equal(calls[0].profile, 'default');
-  assert.equal(calls[0].connectionId, 'local');
-  assert.equal(played.length, 1);
-  player.stop();
-});
-test("stop invalidates late speech and blocks overlapping synthesis", async () => {
-  let resolve, played=0, paused=0, calls=0;
-  const player = mod.createSpeech({owner:()=>({}), api:()=>{calls++; return new Promise(r=>resolve=r);},
-    Audio:class { async play(){played++;} pause(){paused++;} }});
-  const pending = player.speak('first');
-  const second = player.speak('second');
-  assert.equal(calls,1, 'overlapping synthesis must be refused');
-  await assert.rejects(second, /already|pending/i);
-  player.stop();
-  resolve({ok:true,data_url:'data:audio/mpeg;base64,AA=='});
-  await assert.rejects(pending, /stopped|cancel/i);
-  assert.equal(played,0); assert.equal(calls,1);
-  const next = player.speak('next');
-  resolve({ok:true,data_url:'data:audio/mpeg;base64,AA=='});
-  await next; player.stop(); assert.equal(paused,1);
-});
-test("Speak uses authenticated host bridge only on click and unmount discards pending audio", async () => {
-  const calls=[]; let resolve, played=0;
-  sdk.host.state.profile={get:()=> 'default'};
-  sdk.host.state.connectionId={get:()=> 'local'};
-  dom.window.hermesDesktop={api: request => {calls.push(request);return new Promise(r=>resolve=r);}};
-  context.Audio=class {async play(){played++;} pause(){}};
-  const store=mod.createStore({get:()=>null,set(){}});
-  const view=render(runtime.jsx(mod.AACPage,{store}));
-  fireEvent.click(view.getByRole('button',{name:'I',exact:true}));
-  assert.equal(calls.length,0);
-  fireEvent.click(view.getByRole('button',{name:'Speak',exact:true}));
-  assert.equal(calls.length,1,'Speak must call Hermes audio API');
-  assert.equal(calls[0].body.text,'I');
-  view.unmount();
-  resolve({ok:true,data_url:'data:audio/mpeg;base64,AA=='});
-  await new Promise(r=>setTimeout(r,0));
-  assert.equal(played,0); cleanup();
-});
-test("failed playback releases audio and provider failure never falls back", async () => {
-  let paused=0, created=0;
-  const player=mod.createSpeech({owner:()=>({}),api:async()=>({ok:true,data_url:'data:audio/mpeg;base64,AA=='}),
-    Audio:class {constructor(){created++;} async play(){throw Error('Playback denied');} pause(){paused++;}}});
-  await assert.rejects(player.speak('hello'), /Playback denied/);
-  assert.equal(paused,1,'failed playback must release audio');
-  const failed=mod.createSpeech({owner:()=>({}),api:async()=>{throw Error('Provider unavailable');},Audio:class {constructor(){created++;}}});
-  await assert.rejects(failed.speak('hello'), /Provider unavailable/);
-  assert.equal(created,1);
+  const result=await player.speak('  [literal] My exact words!  ');
+  assert.equal(JSON.stringify(calls),JSON.stringify([{method:'voice.tts',params:{text:'  [literal] My exact words!  ',profile:'default'}}]));
+  assert.equal(result.status,'speaking');
+  assert.equal(player.stop,undefined,'No request-scoped cancellation is exposed');
 });
 test("native route registration renders usable board categories and explicit speech controls", () => {
   assert.equal(typeof mod?.default?.register, "function");
@@ -510,7 +414,7 @@ test("native route registration renders usable board categories and explicit spe
   );
   for (const str of [
     "Speak",
-    "Stop",
+    "Start scanning",
     "Undo",
     "Clear",
     "Core words",

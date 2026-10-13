@@ -13,7 +13,8 @@
       "boardTop": 242,
       "coreCells": 24,
       "findStable": true,
-      "focusStopRetained": true
+      "focusScanningRetained": true,
+      "speechStopAbsent": true
     },
     {
       "width": 1920,
@@ -26,7 +27,8 @@
       "boardTop": 242,
       "coreCells": 24,
       "findStable": true,
-      "focusStopRetained": true
+      "focusScanningRetained": true,
+      "speechStopAbsent": true
     },
     {
       "width": 390,
@@ -35,11 +37,12 @@
       "rootScroll": 390,
       "lastTileBottom": 939,
       "viewportHeight": 844,
-      "studioTop": 1169.1875,
+      "studioTop": 1204.375,
       "boardTop": 400,
       "coreCells": 24,
       "findStable": true,
-      "focusStopRetained": true
+      "focusScanningRetained": true,
+      "speechStopAbsent": true
     }
   ],
   "errors": []

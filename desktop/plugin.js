@@ -231,59 +231,32 @@ export function reduce(state, action) {
       return state;
   }
 }
-// Documented native bridge; route tags mirror core hermesApiAs.
+// Public SDK routes the active connection; profile is explicit.
 function speechOwner() {
   return {profile: host.state.profile.get(), connectionId: host.state.connectionId.get()};
 }
-export function createSpeech({
-  api = request => globalThis.window.hermesDesktop.api(request),
-  owner = speechOwner,
-  Audio = globalThis.Audio,
-} = {}) {
-  let audio = null, pending = false, generation = 0;
-  function stop() {
-    generation++;
-    if (audio) { audio.pause(); audio.src = ''; audio = null; }
-  }
+export function createSpeech({request = (method, params) => host.request(method, params), owner = speechOwner} = {}) {
+  let pending = false;
   return {
     async speak(value, choice = neutralDelivery()) {
       text(value, "Utterance", 10000);
-      const synthesis = deliveryText(value, choice), expressive = synthesis !== value;
-      if (pending) throw Error('Speech synthesis already pending. Wait for the previous request to finish.');
-      stop();
-      const ticket = generation, scope = owner();
+      const synthesis = deliveryText(value, choice), scope = owner();
+      if (pending) throw Error('Speech submission already pending. Wait for acknowledgement.');
+      knownOwner(scope);
       pending = true;
-      let configStamp;
-      function checkScope() {
-        if(ticket!==generation)throw Error('Speech stopped; late audio discarded.');
-        if(!sameOwner(scope,owner()))throw Error('Gateway/profile changed; speech discarded.');
-      }
       try {
-        if (expressive) {
-          knownOwner(scope);
-          const settings = await api({...scope,path:'/api/config',method:'GET'});
-          checkScope();
-          if (settings?.tts?.provider !== 'elevenlabs' || settings?.tts?.elevenlabs?.model_id !== 'eleven_v3') throw Error('Expressive speech requires active elevenlabs · eleven_v3. Reset delivery for neutral speech or explicitly enable v3.');
-          configStamp=JSON.stringify(settings.tts);
+        if (synthesis !== value) {
+          const result = await request('config.get', {key:'full', profile:scope.profile});
+          if (!sameOwner(scope, owner())) throw Error('Gateway/profile changed before dispatch; speech not submitted.');
+          const settings = result?.config;
+          if (settings?.tts?.provider !== 'elevenlabs' || settings?.tts?.elevenlabs?.model_id !== 'eleven_v3') throw Error('Expressive speech requires active elevenlabs · eleven_v3. Reset delivery or configure Hermes Settings.');
         }
-        const result = await api({...scope, priority: 'foreground', path:'/api/audio/speak', method:'POST', body:{text:synthesis}, timeoutMs:180000});
-        checkScope();
-        if(expressive) {
-          if(result?.provider!=='elevenlabs')throw Error('Returned speech provider mismatch; tagged audio will not play.');
-          const saved=await api({...scope,path:'/api/config',method:'GET'});
-          checkScope();
-          if(JSON.stringify(saved?.tts)!==configStamp)throw Error('Shared TTS config changed during synthesis; tagged audio discarded.');
-        }
-        if (!result?.ok || !/^data:audio\/[a-z0-9.+-]+;base64,/i.test(result.data_url || '')) throw Error('Hermes returned no valid speech audio.');
-        audio = new Audio(result.data_url);
-        await audio.play();
-        if (ticket !== generation) throw Error('Speech stopped.');
-      } catch (error) {
-        if (ticket === generation) stop();
-        throw error;
+        if (!sameOwner(scope, owner())) throw Error('Gateway/profile changed before dispatch; speech not submitted.');
+        const result = await request('voice.tts', {text:synthesis, profile:scope.profile});
+        if (result?.status !== 'speaking') throw Error('Hermes did not acknowledge speech submission; playback is unverified.');
+        return result;
       } finally { pending = false; }
-    },
-    stop
+    }
   };
 }
 const CATEGORIES = [
@@ -733,52 +706,33 @@ export function attachScanning(
   };
 }
 export function VoicePanel() {
-  const [catalog, setCatalog] = useState([]), [config, setConfig] = useState(null),
-    [query, setQuery] = useState(''), [chosen, setChosen] = useState(null),
-    [busy, setBusy] = useState(false), [message, setMessage] = useState('');
-  const origin = useRef(null), alive = useRef(true);
-  useEffect(()=>{alive.current=true;return()=>{alive.current=false;};},[]);
+  const [config,setConfig]=useState(null),[busy,setBusy]=useState(false),[message,setMessage]=useState('');
+  const lifecycle=useRef(0),pending=useRef(false);
+  useEffect(()=>{lifecycle.current++;return()=>{lifecycle.current++;};},[]);
   async function load() {
-    setBusy(true); setMessage('Loading shared settings and ElevenLabs catalog…'); setChosen(null);setCatalog([]);setConfig(null);
-    const scope = speechOwner(); origin.current=scope;
+    if(pending.current)return;
+    pending.current=true;setBusy(true);setConfig(null);setMessage('Reading current settings…');
+    const ticket=lifecycle.current,scope=speechOwner();
     try {
-      const api = globalThis.window.hermesDesktop.api;
-      const [settings, result] = await Promise.all([
-        api({...scope,path:'/api/config',method:'GET'}),
-        api({...scope,path:'/api/audio/elevenlabs/voices',method:'GET'})
-      ]);
-      if (!alive.current) return;
-      setConfig(settings); setCatalog(result.available ? result.voices : []);
-      setMessage(result.available ? `${result.voices.length} voices loaded from your gateway.` : 'ElevenLabs unavailable. Configure credentials in Hermes Settings; no catalog was fabricated.');
-    } catch(e) {if(alive.current)setMessage(e.message);}
-    finally {if(alive.current)setBusy(false);}
+      knownOwner(scope);
+      const result=await host.request('config.get',{key:'full',profile:scope.profile});
+      if(ticket!==lifecycle.current)return;
+      if(!sameOwner(scope,speechOwner()))throw Error('Gateway/profile changed. Read settings again.');
+      if(!result?.config || typeof result.config!=='object')throw Error('Hermes returned no config snapshot.');
+      // Retain only displayed fields, never the full shared config or secrets.
+      const provider=result.config.tts?.provider || 'default',voice=result.config.tts?.[provider] || {};
+      setConfig({provider,voice:voice.voice_id || voice.voice || 'default',model:voice.model_id || voice.model || 'default'});
+      setMessage('Read-only snapshot; configure voice and model in Hermes Settings.');
+    }catch(e){if(ticket===lifecycle.current)setMessage(e.message);}
+    finally{pending.current=false;if(ticket===lifecycle.current)setBusy(false);}
   }
-  async function apply() {
-    const scope=origin.current;
-    if (!chosen || !scope || busy) return;
-    const current=speechOwner();
-    if(current.profile!==scope.profile || current.connectionId!==scope.connectionId) {setMessage('Gateway/profile changed. Reload voices before applying.');return;}
-    setBusy(true);setMessage('Saving shared Hermes voice…');
-    try {
-      const api=globalThis.window.hermesDesktop.api;
-      const result=await api({...scope,path:'/api/config',method:'PUT',body:{config:{tts:{provider:'elevenlabs',elevenlabs:{voice_id:chosen.voice_id}}}}});
-      if(!result?.ok)throw Error('Hermes did not confirm the config write.');
-      const saved=await api({...scope,path:'/api/config',method:'GET'});
-      if(saved.tts?.provider!=='elevenlabs'||saved.tts?.elevenlabs?.voice_id!==chosen.voice_id)throw Error('Voice write could not be verified. Reload shared settings; do not assume the new voice is active.');
-      if(alive.current){setConfig(saved);setChosen(null);setMessage(`Saved and verified: elevenlabs · ${saved.tts.elevenlabs.voice_id}. Applies to this profile across Hermes, not only AAC; fallback providers may still be used.`);}
-    }catch(e){if(alive.current)setMessage(e.message);}
-    finally{if(alive.current)setBusy(false);}
-  }
-  return jsxs('section', {'aria-label':'ElevenLabs voice browser',children:[
+  return jsxs('section',{'aria-label':'Current Hermes voice',children:[
     jsx('h3',{children:'Your shared Hermes voice'}),
-    jsx('p',{children: config ? `Configured: ${config.tts?.provider || 'default'} · ${config.tts?.elevenlabs?.voice_id || 'no ElevenLabs voice selected'}` : 'Load settings to inspect the active gateway/profile. No settings change on opening this page.'}),
-    control('Load ElevenLabs voices',load,{disabled:busy}),
+    jsx('p',{children:config ? `Configured: ${config.provider} · ${config.voice} · ${config.model}` : 'Read current settings to inspect the active gateway/profile. No settings change here.'}),
+    control('Read current voice settings',load,{disabled:busy}),
     control('Open Hermes Settings',()=>host.navigate('/settings')),
     jsx('p',{role:'status',children:message}),
-    field('Search ElevenLabs voices',jsx('input',{value:query,onChange:e=>setQuery(e.target.value)})),
-    jsx('div',{className:'voice-cards',children:catalog.filter(v=>`${v.label} ${v.voice_id}`.toLowerCase().includes(query.toLowerCase())).map(v=>control(`Choose ${v.label}`,()=>setChosen(v),{'aria-pressed':chosen?.voice_id===v.voice_id,key:v.voice_id}))}),
-    chosen ? jsxs('div',{className:'preview',children:[jsx('p',{children:`Selected for review: ${chosen.label} · ${chosen.voice_id}. Applying explicitly changes shared tts.provider to elevenlabs and tts.elevenlabs.voice_id for ${origin.current?.profile || 'default'}. Other settings are preserved.`}),control('Apply ElevenLabs voice to Hermes',apply,{disabled:busy}),control('Cancel voice selection',()=>setChosen(null),{disabled:busy})]}) : null,
-    jsx('p',{className:'small',children:'Only non-secret voice metadata is returned. The gateway keeps the ElevenLabs key. This catalog endpoint exposes no sample URL or per-voice preview door; no direct provider fetch or temporary voice swap is used.'})
+    jsx('p',{className:'small',children:'No voice catalog, model toggle or provider/settings writes. This snapshot is not provider attestation; Hermes may use fallback providers.'})
   ]});
 }
 export function AccessPanel({ settings, dispatch }) {
@@ -796,7 +750,7 @@ export function AccessPanel({ settings, dispatch }) {
       jsx("p", {
         className: "small",
         children:
-          "Scanning includes words, categories, Speak, Stop, Undo, Clear and panel buttons. It never auto-selects or auto-speaks.",
+          "Scanning includes words, categories, Speak, Undo, Clear and panel buttons. It never auto-selects or auto-speaks.",
       }),
       jsx("div", {
         className: "setting-grid",
@@ -1144,40 +1098,6 @@ export function deliveryText(value, choice = neutralDelivery()) {
 function sameOwner(a,b) {return a?.profile===b?.profile && a?.connectionId===b?.connectionId;}
 function knownOwner(scope) {if(!scope?.profile || !scope?.connectionId)throw Error('Expressive speech requires a known gateway/profile.');}
 function DeliveryPanel({value,choice,onChange}) {
-  const [review,setReview]=useState(null),[busy,setBusy]=useState(false),[message,setMessage]=useState('');
-  const lifecycle=useRef(0);
-  useEffect(()=>{lifecycle.current++;return()=>{lifecycle.current++;};},[]);
-  async function reviewModel() {
-    if(busy)return;
-    const ticket=lifecycle.current,scope=speechOwner();setReview(null);setBusy(true);setMessage('Reading shared model settings…');
-    try {
-      knownOwner(scope);
-      const saved=await window.hermesDesktop.api({...scope,path:'/api/config',method:'GET'});
-      if(ticket!==lifecycle.current)return;
-      if(!sameOwner(scope,speechOwner()))throw Error('Gateway/profile changed. Review again.');
-      if(saved?.tts?.provider!=='elevenlabs')throw Error('Select ElevenLabs explicitly in Access & voice first. Enabling v3 never switches providers.');
-      setReview({scope,model:saved.tts.elevenlabs?.model_id});setMessage(`Active model: ${saved.tts.elevenlabs?.model_id || 'default'}`);
-    }catch(e){if(ticket===lifecycle.current)setMessage(e.message);}
-    finally{if(ticket===lifecycle.current)setBusy(false);}
-  }
-  async function enableModel() {
-    if(!review||busy)return;
-    const ticket=lifecycle.current,{scope,model}=review;setBusy(true);setMessage('Saving shared Eleven v3 model…');setReview(null);
-    try {
-      if(!sameOwner(scope,speechOwner()))throw Error('Gateway/profile changed. Review again.');
-      const api=window.hermesDesktop.api;
-      const fresh=await api({...scope,path:'/api/config',method:'GET'});
-      if(ticket!==lifecycle.current)return;
-      if(!sameOwner(scope,speechOwner())||fresh?.tts?.provider!=='elevenlabs'||fresh.tts.elevenlabs?.model_id!==model)throw Error('Shared config changed. Review again before enabling v3.');
-      const result=await api({...scope,path:'/api/config',method:'PUT',body:{config:{tts:{elevenlabs:{model_id:'eleven_v3'}}}}});
-      if(!result?.ok)throw Error('Hermes did not confirm the model write.');
-      const saved=await api({...scope,path:'/api/config',method:'GET'});
-      if(ticket!==lifecycle.current)return;
-      if(!sameOwner(scope,speechOwner())||saved?.tts?.provider!=='elevenlabs'||saved.tts.elevenlabs?.model_id!=='eleven_v3')throw Error('Model write could not be verified. Reload settings; do not assume v3 is active.');
-      setMessage('Eleven v3 saved and verified for this shared Hermes profile. Voice and provider unchanged.');
-    }catch(e){if(ticket===lifecycle.current)setMessage(e.message);}
-    finally{if(ticket===lifecycle.current)setBusy(false);}
-  }
   let preview;
   try{preview=deliveryText(value,choice);}catch(e){preview=`Cannot synthesize: ${e.message}`;}
   const pick=(label,key,options)=>field(label,jsx('select',{value:choice[key],onChange:e=>onChange({...choice,[key]:e.target.value}),children:options.map(id=>jsx('option',{value:id,children:id[0].toUpperCase()+id.slice(1)},id))}));
@@ -1186,38 +1106,39 @@ function DeliveryPanel({value,choice,onChange}) {
     jsx('p',{children:'Neutral uses your exact message with Hermes settings. Optional tags require ElevenLabs Eleven v3; delivery is voice-dependent, not guaranteed. No emotion is inferred and nothing speaks automatically.'}),
     jsx('div',{className:'setting-grid',children:[pick('Delivery emotion','emotion',EMOTIONS),pick('Vocal delivery','delivery',DELIVERIES),pick('Vocal cue','cue',CUES)]}),
     control('Reset delivery',()=>onChange(neutralDelivery())),
-    control('Review Enable Eleven v3',reviewModel,{disabled:busy}),
-    jsx('p',{role:'status',children:message}),
-    review ? jsxs('div',{className:'preview',children:[jsx('p',{children:`Confirm changing shared tts.elevenlabs.model_id from ${review.model || 'default'} to eleven_v3 for ${review.scope.profile} · ${review.scope.connectionId}. This affects all Hermes speech for that owner, not just AAC. Provider and voice will not change. No speech is generated.`}),control('Enable Eleven v3 in shared Hermes settings',enableModel,{disabled:busy}),control('Cancel model change',()=>setReview(null),{disabled:busy})]}) : null,
+    control('Open Hermes Settings',()=>host.navigate('/settings')),
+    jsx('p',{children:'Configure Eleven v3 in Hermes Settings. AAC never changes models or providers. The pre-dispatch config check is a snapshot, not an atomic guarantee or provider attestation.'}),
     jsx('h3',{children:'Exact synthesis request · not your message'}),
     jsx('pre',{'aria-label':'Exact synthesis preview',style:{whiteSpace:'pre-wrap',overflowWrap:'anywhere'},children:preview}),
     jsx('p',{className:'small',children:'Vocal cues may add non-verbal sounds. Words in the message strip never change. No SSML or arbitrary tags. Hermes backend normalization still applies.'})
   ]});
 }
 export function AACPage({ store }) {
+  const [speechPending,setSpeechPending]=useState(false);
+  const submitting=useRef(false);
   const [managePhrases,setManagePhrases]=useState(false);
   const [find,setFind]=useState('');
   const [presets,setPresets]=useState(false);
   const [state,setState]=useState(store.get),[panel,setPanel]=useState('Context / AI'),[studio,setStudio]=useState(false),[focus,setFocus]=useState(false),[visited,setVisited]=useState(['Context / AI']),[notice,setNotice]=useState(''),[scanning,setScanning]=useState(false),[scanLabel,setScanLabel]=useState(''),[contextTopic,setContextTopic]=useState(''),[delivery,setDelivery]=useState(neutralDelivery);
   const root=useRef(null),speech=useRef(null),mounted=useRef(true),scannerRef=useRef(null);
   if(!speech.current)speech.current=createSpeech();
-  useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;speech.current.stop();};},[]);
+  useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
   useEffect(()=>store.subscribe(setState),[store]);
   useEffect(()=>{if(!scanning||!root.current)return;const scanner=attachScanning(root.current,{scanMs:state.settings.scanMs,onExit:()=>setScanning(false),onTarget:setScanLabel});scannerRef.current=scanner;return()=>{scanner.dispose();scannerRef.current=null;};},[scanning,state.settings.scanMs]);
   useEffect(()=>{scannerRef.current?.refresh();},[state,panel,studio,focus,presets,managePhrases,find]);
   const dispatch=action=>{try{store.dispatch(action);}catch(e){setNotice(e.message);}};
   const boards=[...builtinBoards(),...state.custom],board=boards.find(b=>b.id===state.active)||boards[0];
-  function chooseDelivery(choice){speech.current.stop();setDelivery(validateDelivery(choice));}
+  function chooseDelivery(choice){setDelivery(validateDelivery(choice));}
   function openPanel(name){setPanel(name);setVisited(v=>v.includes(name)?v:[...v,name]);setStudio(true);setFocus(false);}
   function closeStudio(){setStudio(false);root.current?.querySelector('[data-studio-toggle]')?.focus();}
-  async function doSpeak(){try{setNotice('Requesting speech from Hermes. Cloud providers may receive this exact message; local providers run on the gateway.');await speech.current.speak(store.get().words.join(' '),delivery);if(mounted.current)setNotice('Playing your words with Hermes voice settings.');}catch(e){if(mounted.current)setNotice(e.message);}}
+  async function doSpeak(){if(submitting.current)return;submitting.current=true;setSpeechPending(true);try{setNotice('Submitting speech to Hermes; audio is backend-owned.');await speech.current.speak(store.get().words.join(' '),delivery);if(mounted.current)setNotice('Submitted to Hermes · acknowledgement only, not playback completion. No request-scoped cancellation or later error tracking.');}catch(e){if(mounted.current)setNotice(e.message);}finally{submitting.current=false;if(mounted.current)setSpeechPending(false);}}
   const tabs=['Context / AI','Expression','Access & voice','Boards'];
   let exact;try{exact=deliveryText(state.words.join(' '),delivery);}catch(e){exact=e.message;}
   const icon=(name)=>jsx(Codicon,{name,size:18});
   return jsxs('main',{className:`haac cockpit${focus?' focus-mode':''}`,ref:root,tabIndex:-1,children:[
     jsx('style',{children:CSS}),
     jsxs('header',{className:'cockpit-header',children:[jsxs('div',{className:'identity',children:[icon('comment-discussion'),jsx('h1',{children:'Communication'}),jsx('span',{className:'status-chip',children:'Board ready · speech on demand'})]}),jsxs('div',{className:'tools',children:[control(scanning?'Stop scanning':'Start scanning',()=>setScanning(v=>!v),{'aria-pressed':scanning}),control(focus?'Exit focus mode':'Focus mode',()=>{setFocus(v=>!v);root.current?.focus({preventScroll:true});},{'aria-pressed':focus}),!focus?control('Studio',()=>studio?closeStudio():setStudio(true),{'aria-expanded':studio,'aria-controls':'aac-studio','data-studio-toggle':true}):null]})]}),
-    jsxs('section',{className:'message-dock','aria-label':'Your message',children:[jsx('div',{className:'utterance','aria-label':'Utterance strip',children:state.words.length?state.words.map((word,i)=>jsx('span',{className:'word',children:word},i)):jsx('span',{className:'placeholder',children:'Choose words to build your message…'})}),jsxs('div',{className:'message-actions',children:[control('Speak',doSpeak,{className:'speak-primary',disabled:!state.words.length}),control('Stop',()=>{speech.current.stop();setNotice('Playback stopped; pending audio will be discarded. Hermes may finish synthesis; its native API cannot cancel the server request.');},{className:'stop-action'}),control('Undo',()=>dispatch({type:'undo'}),{disabled:!state.words.length}),control('Clear',()=>dispatch({type:'clear'}),{disabled:!state.words.length,className:'clear-action'})]})]}),
+    jsxs('section',{className:'message-dock','aria-label':'Your message',children:[jsx('div',{className:'utterance','aria-label':'Utterance strip',children:state.words.length?state.words.map((word,i)=>jsx('span',{className:'word',children:word},i)):jsx('span',{className:'placeholder',children:'Choose words to build your message…'})}),jsxs('div',{className:'message-actions',children:[control('Speak',doSpeak,{className:'speak-primary',disabled:speechPending||!state.words.length}),control('Undo',()=>dispatch({type:'undo'}),{disabled:!state.words.length}),control('Clear',()=>dispatch({type:'clear'}),{disabled:!state.words.length,className:'clear-action'})]})]}),
     scanning?jsx('div',{className:'scan-status',role:'status','aria-label':'Scanning status',children:`Scanning · ${scanLabel} · Space selects · Escape stops`}):null,
     !focus?jsxs('div',{className:'delivery-summary',children:[control(`Delivery: ${delivery.emotion} · ${delivery.delivery} · ${delivery.cue}`,()=>openPanel('Expression'),{'aria-label':'Expression'}),jsxs('div',{className:'preset-anchor',children:[control('Delivery presets',()=>setPresets(v=>!v),{'aria-expanded':presets,'aria-controls':'aac-presets'}),presets?jsxs('div',{id:'aac-presets',className:'preset-popover','aria-label':'Explicit delivery presets',onKeyDown:e=>{if(e.key==='Escape'){setPresets(false);e.stopPropagation();root.current?.querySelector('[aria-controls="aac-presets"]')?.focus();}},children:[jsx('p',{children:'Tags require Eleven v3. Selection never speaks.'}),...['neutral','happy','thoughtful','excited'].map(emotion=>control(`${emotion[0].toUpperCase()+emotion.slice(1)} delivery`,()=>{chooseDelivery({...neutralDelivery(),emotion});setPresets(false);root.current?.querySelector('[aria-controls="aac-presets"]')?.focus();},{key:emotion}))]}):null]}),jsxs('details',{children:[jsx('summary',{'data-scan':true,children:'Exact request preview'}),jsx('pre',{'aria-label':'Compact synthesis preview',children:exact})]})]}):null,
     jsxs('div',{className:`cockpit-body${studio&&!focus?' studio-open':''}`,children:[
@@ -1232,7 +1153,7 @@ export function AACPage({ store }) {
         ]}),
         jsx('div',{className:'board-meta',children:`${board.name} · Fixed ${board.grid.rows} × ${board.grid.columns} layout · Text vocabulary`}),
         jsx('div',{className:'notice',role:'status','aria-live':'polite',children:notice}),
-        jsx('p',{className:'privacy-note',children:'Cloud/local TTS depends on Hermes settings · Speak shares with that provider · No automatic speech'})
+        jsx('p',{className:'privacy-note',children:'Cloud/local TTS depends on Hermes settings · Backend-owned audio may play on a remote gateway host. No speech Stop, request-scoped cancellation, completion or later error tracking. Speak shares with the configured provider; no automatic speech.'})
       ]}),
       studio?jsxs('aside',{hidden:focus,id:'aac-studio',className:'studio','aria-label':'Communication studio',children:[jsxs('div',{className:'studio-heading',children:[jsx('h2',{children:'Studio'}),control('Close',closeStudio,{'aria-label':'Close studio'})]}),jsx('div',{role:'tablist','aria-label':'Communication studio',className:'studio-tabs',children:tabs.map((name,i)=>control(name,()=>openPanel(name),{role:'tab',id:`studio-tab-${i}`,'aria-selected':panel===name,'aria-controls':`studio-panel-${i}`,key:name}))}),...tabs.filter(name=>visited.includes(name)).map(name=>jsx('section',{role:'tabpanel',id:`studio-panel-${tabs.indexOf(name)}`,'aria-labelledby':`studio-tab-${tabs.indexOf(name)}`,hidden:panel!==name,children:name==='Boards'?jsx(BoardsPanel,{board,state,dispatch,setNotice}):name==='Access & voice'?jsx(AccessPanel,{settings:state.settings,dispatch}):name==='Expression'?jsx(DeliveryPanel,{value:state.words.join(' '),choice:delivery,onChange:chooseDelivery}):jsxs('div',{children:[jsx(SituationWorkspace,{onSelect:text=>dispatch({type:'select',text}),onExplore:topic=>{setContextTopic(topic);}}),jsx(HermesPanel,{store,setNotice,initialTopic:contextTopic,onDelivery:chooseDelivery},contextTopic)]})},name))]}):null
     ]}),
@@ -1306,7 +1227,7 @@ export default {
         run: () => host.navigate("/aac"),
       },
     });
-    // React page cleanup silences this plugin only.
+    // Unmount releases UI subscriptions only; backend speech cannot be cancelled.
   },
 };
 
