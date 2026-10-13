@@ -11,6 +11,18 @@ verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
 
 class PackageTests(unittest.TestCase):
+    def test_unicode_results_print_on_windows_legacy_console(self):
+        import io
+        import sys
+        from unittest.mock import patch
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding='cp1252')
+        with patch.object(sys, 'stdout', stream), patch.object(sys, 'stderr', stream):
+            verify.configure_output()
+            print('\u2714 passed')
+            stream.flush()
+        self.assertIn('\u2714 passed'.encode('utf-8'), buffer.getvalue())
+
     def test_archive_contains_exact_current_source_and_no_old_screenshots(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('AAC_TEST_SCRATCH', verify.ROOT/'.test-scratch')) as temp:
             target = Path(temp) / 'plugin.zip'

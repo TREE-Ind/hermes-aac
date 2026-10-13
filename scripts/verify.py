@@ -27,7 +27,15 @@ def create_archive(root, target):
         if archive.testzip() or archive.read('hermes-aac/desktop/plugin.js') != (root / 'desktop/plugin.js').read_bytes():
             raise RuntimeError('ZIP readback failed.')
 
+def configure_output():
+    # Windows CI consoles can default to cp1252; Node test results contain Unicode.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
+
+
 def main():
+    configure_output()
     parser = argparse.ArgumentParser()
     parser.add_argument('--install', action='store_true')
     parser.add_argument('--package', action='store_true')
