@@ -1,0 +1,19 @@
+name: hermes-aac
+version: "0.1.0"
+description: Augmentative and alternative communication workspace for Hermes Desktop.
+author: TREE Industries
+license: MIT
+homepage: https://github.com/TREE-Ind/hermes-aac
+requires_hermes: ">=0.21.7"
+manifest_version: 2
+kind: standalone
+requires_env: []
+provides_tools: []
+provides_hooks: []
+python_dependencies: []
+config_schema: {}
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []

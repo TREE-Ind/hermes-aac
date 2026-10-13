@@ -1,0 +1,19 @@
+{
+  "name": "hermes-aac",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --experimental-vm-modules --test tests/*.test.mjs",
+    "check": "node --check desktop/plugin.js",
+    "render": "node scripts/render-harness.mjs"
+  },
+  "devDependencies": {
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "jsdom": "26.1.0",
+    "@testing-library/react": "16.3.0",
+    "esbuild": "0.25.12",
+    "playwright": "1.56.1"
+  }
+}

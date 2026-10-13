@@ -1,0 +1,35 @@
+name: Developer tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: npm ci
+      - run: npm run check
+      - run: python scripts/verify.py
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 71d34bad1045610252eda02ee79549436896e784
+          path: hermes-source
+      - name: Released v0.21.7 source-contract and provider fixtures (not live providers)
+        shell: pwsh
+        run: |
+          $env:HERMES_SOURCE = (Resolve-Path hermes-source).Path
+          python scripts/check-hermes-contract.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -p test_verify.py

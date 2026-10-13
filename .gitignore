@@ -1,0 +1,7 @@
+node_modules/
+__pycache__/
+*.pyc
+.test-scratch/
+TEST-RESULTS.txt
+*.zip
+hermes-source/

@@ -1,0 +1,46 @@
+{
+  "boundary": "Actual React/plugin; SDK/native mocks; synthetic theme; Codicon glyph placeholders, not live host fonts",
+  "requests": "No provider, generation or config requests",
+  "viewports": [
+    {
+      "width": 1366,
+      "height": 768,
+      "rootWidth": 1366,
+      "rootScroll": 1366,
+      "lastTileBottom": 672,
+      "viewportHeight": 768,
+      "studioTop": 242,
+      "boardTop": 242,
+      "coreCells": 24,
+      "findStable": true,
+      "focusStopRetained": true
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "rootWidth": 1920,
+      "rootScroll": 1920,
+      "lastTileBottom": 672,
+      "viewportHeight": 1080,
+      "studioTop": 242,
+      "boardTop": 242,
+      "coreCells": 24,
+      "findStable": true,
+      "focusStopRetained": true
+    },
+    {
+      "width": 390,
+      "height": 844,
+      "rootWidth": 390,
+      "rootScroll": 390,
+      "lastTileBottom": 939,
+      "viewportHeight": 844,
+      "studioTop": 1169.1875,
+      "boardTop": 400,
+      "coreCells": 24,
+      "findStable": true,
+      "focusStopRetained": true
+    }
+  ],
+  "errors": []
+}
